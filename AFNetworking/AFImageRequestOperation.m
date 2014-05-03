@@ -26,10 +26,90 @@ static dispatch_queue_t image_request_operation_processing_queue() {
     static dispatch_queue_t af_image_request_operation_processing_queue;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        af_image_request_operation_processing_queue = dispatch_queue_create("com.alamofire.networking.image-request.processing", 0);
+        af_image_request_operation_processing_queue = dispatch_queue_create("com.alamofire.networking.image-request.processing", DISPATCH_QUEUE_CONCURRENT);
     });
     return af_image_request_operation_processing_queue;
 }
+
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+#import <CoreGraphics/CoreGraphics.h>
+
+static UIImage * AFImageWithDataAtScale(NSData *data, CGFloat scale) {
+    UIImage *image = [[UIImage alloc] initWithData:data];
+    
+    return [[UIImage alloc] initWithCGImage:[image CGImage] scale:scale orientation:image.imageOrientation];
+}
+
+static UIImage * AFInflatedImageFromResponseWithDataAtScale(NSHTTPURLResponse *response, NSData *data, CGFloat scale) {
+    if (!data || [data length] == 0) {
+        return nil;
+    }
+
+    UIImage *image = AFImageWithDataAtScale(data, scale);
+    if (image.images) {
+        return image;
+    }
+    
+    CGImageRef imageRef = nil;
+    CGDataProviderRef dataProvider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
+
+    if ([response.MIMEType isEqualToString:@"image/png"]) {
+        imageRef = CGImageCreateWithPNGDataProvider(dataProvider,  NULL, true, kCGRenderingIntentDefault);
+    } else if ([response.MIMEType isEqualToString:@"image/jpeg"]) {
+        imageRef = CGImageCreateWithJPEGDataProvider(dataProvider, NULL, true, kCGRenderingIntentDefault);
+    }
+    
+    if (!imageRef) {
+        imageRef = CGImageCreateCopy([image CGImage]);
+
+        if (!imageRef) {
+            CGDataProviderRelease(dataProvider);
+            return image;
+        }
+    }
+
+    CGDataProviderRelease(dataProvider);
+
+    size_t width = CGImageGetWidth(imageRef);
+    size_t height = CGImageGetHeight(imageRef);
+    size_t bitsPerComponent = CGImageGetBitsPerComponent(imageRef);
+    size_t bytesPerRow = 0; // CGImageGetBytesPerRow() calculates incorrectly in iOS 5.0, so defer to CGBitmapContextCreate()
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGBitmapInfo bitmapInfo = CGImageGetBitmapInfo(imageRef);
+
+    if (CGColorSpaceGetNumberOfComponents(colorSpace) == 3) {
+        int alpha = (bitmapInfo & kCGBitmapAlphaInfoMask);
+        if (alpha == kCGImageAlphaNone) {
+            bitmapInfo &= ~kCGBitmapAlphaInfoMask;
+            bitmapInfo |= kCGImageAlphaNoneSkipFirst;
+        } else if (!(alpha == kCGImageAlphaNoneSkipFirst || alpha == kCGImageAlphaNoneSkipLast)) {
+            bitmapInfo &= ~kCGBitmapAlphaInfoMask;
+            bitmapInfo |= kCGImageAlphaPremultipliedFirst;
+        }
+    }
+
+    CGContextRef context = CGBitmapContextCreate(NULL, width, height, bitsPerComponent, bytesPerRow, colorSpace, bitmapInfo);
+
+    CGColorSpaceRelease(colorSpace);
+
+    if (!context) {
+        CGImageRelease(imageRef);
+
+        return image;
+    }
+
+    CGRect rect = CGRectMake(0.0f, 0.0f, width, height);
+    CGContextDrawImage(context, rect, imageRef);
+    CGImageRef inflatedImageRef = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+
+    UIImage *inflatedImage = [[UIImage alloc] initWithCGImage:inflatedImageRef scale:scale orientation:image.imageOrientation];
+    CGImageRelease(inflatedImageRef);
+    CGImageRelease(imageRef);
+    
+    return inflatedImage;
+}
+#endif
 
 @interface AFImageRequestOperation ()
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
@@ -74,17 +154,19 @@ static dispatch_queue_t image_request_operation_processing_queue() {
 										 success:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, UIImage *image))success
 										 failure:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, NSError *error))failure
 {
-    AFImageRequestOperation *requestOperation = [[AFImageRequestOperation alloc] initWithRequest:urlRequest];
+    AFImageRequestOperation *requestOperation = [(AFImageRequestOperation *)[self alloc] initWithRequest:urlRequest];
     [requestOperation setCompletionBlockWithSuccess:^(AFHTTPRequestOperation *operation, id responseObject) {
         if (success) {
             UIImage *image = responseObject;
             if (imageProcessingBlock) {
                 dispatch_async(image_request_operation_processing_queue(), ^(void) {
                     UIImage *processedImage = imageProcessingBlock(image);
-
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu"
                     dispatch_async(operation.successCallbackQueue ?: dispatch_get_main_queue(), ^(void) {
                         success(operation.request, operation.response, processedImage);
                     });
+#pragma clang diagnostic pop
                 });
             } else {
                 success(operation.request, operation.response, image);
@@ -105,7 +187,7 @@ static dispatch_queue_t image_request_operation_processing_queue() {
 										 success:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, NSImage *image))success
 										 failure:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, NSError *error))failure
 {
-    AFImageRequestOperation *requestOperation = [[AFImageRequestOperation alloc] initWithRequest:urlRequest];
+    AFImageRequestOperation *requestOperation = [(AFImageRequestOperation *)[self alloc] initWithRequest:urlRequest];
     [requestOperation setCompletionBlockWithSuccess:^(AFHTTPRequestOperation *operation, id responseObject) {
         if (success) {
             NSImage *image = responseObject;
@@ -139,6 +221,7 @@ static dispatch_queue_t image_request_operation_processing_queue() {
 
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
     self.imageScale = [[UIScreen mainScreen] scale];
+    self.automaticallyInflatesResponseImage = YES;
 #endif
 
     return self;
@@ -148,9 +231,11 @@ static dispatch_queue_t image_request_operation_processing_queue() {
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
 - (UIImage *)responseImage {
     if (!_responseImage && [self.responseData length] > 0 && [self isFinished]) {
-        UIImage *image = [UIImage imageWithData:self.responseData];
-
-        self.responseImage = [UIImage imageWithCGImage:[image CGImage] scale:self.imageScale orientation:image.imageOrientation];
+        if (self.automaticallyInflatesResponseImage) {
+            self.responseImage = AFInflatedImageFromResponseWithDataAtScale(self.response, self.responseData, self.imageScale);
+        } else {
+            self.responseImage = AFImageWithDataAtScale(self.responseData, self.imageScale);
+        }
     }
 
     return _responseImage;
@@ -202,6 +287,8 @@ static dispatch_queue_t image_request_operation_processing_queue() {
 {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-retain-cycles"
+#pragma clang diagnostic ignored "-Wgnu"
+
     self.completionBlock = ^ {
         dispatch_async(image_request_operation_processing_queue(), ^(void) {
             if (self.error) {
@@ -225,7 +312,7 @@ static dispatch_queue_t image_request_operation_processing_queue() {
                     });
                 }
             }
-        });        
+        });
     };
 #pragma clang diagnostic pop
 }
